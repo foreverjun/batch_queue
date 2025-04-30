@@ -1,18 +1,14 @@
-// --- Зависимости и импорты ---
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::iter::IntoIterator;
-use core::marker::PhantomData;
-use std::mem::MaybeUninit;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr as StdAtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr as StdAtomicPtr, Ordering};
 use haphazard::raw::Pointer;
-use haphazard::{raw, AtomicPtr, Domain, Global, HazardPointer, Singleton};
+use haphazard::{AtomicPtr, Domain, HazardPointer};
+use std::mem::MaybeUninit;
+use std::ptr::null_mut;
 
-// --- Вспомогательные константы и функции для тегирования указателей ---
-// ... (без изменений) ...
 const ANN_TAG: usize = 1;
 
 #[inline(always)]
@@ -40,7 +36,6 @@ fn get_node_ptr<T>(ptr: *mut Node<T>) -> *mut Node<T> {
     ptr
 }
 
-// --- Основные структуры данных ---
 struct Node<T> {
     item: MaybeUninit<T>,
     next: AtomicPtr<Node<T>>,
@@ -51,26 +46,23 @@ type PtrOrAnn<T> = StdAtomicPtr<T>;
 struct InternalBatchRequest<T> {
     first_enq: *mut Node<T>,
     last_enq: *mut Node<T>,
-    enqs_num: usize,
 }
 
 struct Ann<T> {
     batch_req: InternalBatchRequest<T>,
     old_head_node: *mut Node<T>,
-    old_head_count: usize,
     old_tail_node: AtomicPtr<Node<T>>,
-    old_tail_count: AtomicUsize,
 }
 unsafe impl<T: Send> Send for Ann<T> {}
 
-// --- Очередь BQ ---
-pub struct BQueue<T> {
+pub struct BQueue<T>
+where
+    T: Send + Sync,
+{
     head: PtrOrAnn<Node<T>>,
     tail: AtomicPtr<Node<T>>,
 }
 
-// --- Трейт-расширение для Domain ---
-// Теперь методы можно вызывать прямо на Domain::global()
 trait RetireHelpers {
     unsafe fn retire_node<T: Send>(&self, node: *mut Node<T>);
     unsafe fn retire_ann<T: Send>(&self, ann: *mut Ann<T>);
@@ -78,13 +70,11 @@ trait RetireHelpers {
 
 impl<F: 'static> RetireHelpers for Domain<F> {
     unsafe fn retire_node<T: Send>(&self, node: *mut Node<T>) {
-        // Safety: Передаем гарантии безопасности от вызывающего кода
         unsafe {
             self.retire_ptr::<Node<T>, Box<Node<T>>>(node);
         }
     }
     unsafe fn retire_ann<T: Send>(&self, ann: *mut Ann<T>) {
-        // Safety: Передаем гарантии безопасности от вызывающего кода
         unsafe {
             self.retire_ptr::<Ann<T>, Box<Ann<T>>>(ann);
         }
@@ -152,7 +142,7 @@ where
         }
     }
 
-    fn enqueue_to_shared(&self, item: T) {
+    pub fn enqueue(&self, item: T) {
         let new_node_ptr = Box::into_raw(Box::new(Node::new(item)));
         let mut hp_tail = HazardPointer::new();
         let mut hp_ann = HazardPointer::new();
@@ -194,7 +184,7 @@ where
         }
     }
 
-    fn dequeue_from_shared(&self) -> Option<T> {
+    pub fn dequeue(&self) -> Option<T> {
         let mut hp_head = HazardPointer::new();
         let mut hp_next = HazardPointer::new();
 
@@ -207,13 +197,6 @@ where
                 return None;
             }
             let next_node_opt = head_node_ref.next.safe_load(&mut hp_next).unwrap();
-            // let current_head_raw = self.head.load(Ordering::Acquire);
-            // if !is_ann(current_head_raw) && current_head_raw != head_node_ptr {
-            //     hp_head.reset_protection();
-            //     hp_next.reset_protection();
-            //     continue;
-            // }
-
             if let Ok(_) = self.head.compare_exchange(
                 head_node_ptr,
                 next_node_ptr,
@@ -224,354 +207,350 @@ where
                 return Some(unsafe {
                     std::ptr::read(next_node_opt.item.assume_init_ref() as *const _)
                 });
-                
             }
-            // match self.head.compare_exchange(
-            //     head_node_ptr,
-            //     next_node_ptr,
-            //     Ordering::Release,
-            //     Ordering::Acquire,
-            // ) {
-            //     Ok(_) => {
-            //         let item = unsafe { (*next_node_ptr).item.take() };
-            //         // retire_node вызывается на глобальном домене
-            //         unsafe {
-            //             domain.retire_node(head_node_ptr);
-            //         }
-            //         hp_head.reset_protection();
-            //         hp_next.reset_protection();
-            //         return item;
-            //     }
-            //     Err(_) => {}
-            // }
-
             hp_head.reset_protection();
             hp_next.reset_protection();
         }
     }
 
-    // execute_deqs_batch: использует глобальный домен
-    fn execute_deqs_batch(&self, num_deqs_requested: usize) -> (*mut Node<T>, usize) {
+    pub fn execute_deqs_batch(&self, num_deqs_requested: usize) -> DeqBatchIterator<T> {
         let mut hp_head = HazardPointer::new();
-        let mut hp_traverse = HazardPointer::new();
+        let mut hp1 = HazardPointer::new();
+        let mut hp2 = HazardPointer::new();
+
+        let mut successful_deqs;
+        let mut old_head_ptr: *mut Node<T>;
+        let mut last_deq_item_ptr: *const MaybeUninit<T>;
 
         loop {
-            let (start_head_ptr, start_head_count) = self.help_ann_and_get_head(&mut hp_head); // Использует глоб. домен
-                                                                                               // ... (логика обхода списка и подсчета) ...
-            if start_head_ptr.is_null() {
-                hp_head.reset_protection();
-                return (ptr::null_mut(), 0);
-            }
-            let mut current_node_ptr = start_head_ptr;
-            let mut successful_deqs = 0;
-            let mut new_head_ptr = start_head_ptr;
-            if unsafe { hp_traverse.protect_raw(current_node_ptr) }.is_null() {
-                hp_head.reset_protection();
-                continue;
-            }
-            for _ in 0..num_deqs_requested {
-                let current_node_ref = unsafe { &*hp_traverse.deref().unwrap().as_ptr() };
-                let next_node_opt = unsafe { current_node_ref.next.load(&mut hp_traverse) };
-                if let Some(next_node) = next_node_opt {
-                    new_head_ptr = next_node as *const _ as *mut _;
+            successful_deqs = 0;
+            old_head_ptr = self.help_ann_and_get_head(&mut hp_head);
+
+            let mut new_head_node = unsafe { old_head_ptr.as_ref().unwrap() };
+            while successful_deqs < num_deqs_requested {
+                let head_next_node = new_head_node.next.safe_load(&mut hp1);
+
+                if let Some(head_next) = head_next_node {
                     successful_deqs += 1;
+                    new_head_node = head_next;
+
+                    if successful_deqs >= num_deqs_requested {
+                        break;
+                    }
+
+                    let head_next_node_2 = new_head_node.next.safe_load(&mut hp2);
+                    if let Some(head_next_2) = head_next_node_2 {
+                        successful_deqs += 1;
+                        new_head_node = head_next_2;
+                    } else {
+                        break;
+                    }
                 } else {
                     break;
                 }
             }
             if successful_deqs == 0 {
-                hp_head.reset_protection();
-                hp_traverse.reset_protection();
-                return (start_head_ptr, 0);
+                return DeqBatchIterator::new(0, None, null_mut());
             }
-            let new_head_count = start_head_count + successful_deqs;
-            let new_head_ref = unsafe { &*hp_traverse.deref().unwrap().as_ptr() };
-            new_head_ref.count.store(new_head_count, Ordering::Release);
 
-            match self.head.compare_exchange(
-                start_head_ptr,
-                new_head_ptr,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    /* ... */
-                    hp_head.reset_protection();
-                    hp_traverse.reset_protection();
-                    return (start_head_ptr, successful_deqs);
-                }
-                Err(_) => { /* ... */ }
+            last_deq_item_ptr = &new_head_node.item;
+            if self
+                .head
+                .compare_exchange(
+                    old_head_ptr,
+                    new_head_node as *const _ as *mut _,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                break;
             }
             hp_head.reset_protection();
-            hp_traverse.reset_protection();
+            hp1.reset_protection();
+            hp2.reset_protection();
         }
+        let last_item = unsafe { Some(std::ptr::read(last_deq_item_ptr).assume_init()) };
+
+        DeqBatchIterator::new(successful_deqs, last_item, old_head_ptr)
     }
 
-    // execute_enqs_batch: использует глобальный домен
-    fn execute_enqs_batch(&self, batch_req: InternalBatchRequest<T>) -> *mut Node<T> {
-        let ann_ptr = Box::into_raw(Box::new(Ann {
-            batch_req, /* ... */
-        }));
+    fn execute_enqs_batch(&self, batch_req: InternalBatchRequest<T>) {
+        let ann_ptr = Box::new(Ann {
+            batch_req: batch_req,
+            old_head_node: null_mut(),
+            old_tail_node: unsafe { AtomicPtr::new(null_mut()) },
+        })
+        .into_raw();
         let tagged_ann_ptr = tag_ann(ann_ptr);
-        let mut hp_head = HazardPointer::new(); // Использует глоб. домен
-
-        let original_head_ptr;
+        let mut hp_head = HazardPointer::new();
         loop {
-            let head_node_ptr = self.help_ann_and_get_head(&mut hp_head); // Использует глоб. домен
-                                                                                        // ... (сохранение head в ann) ...
-            if head_node_ptr.is_null() {
-                hp_head.reset_protection();
-                continue;
+            let old_head_ptr = self.help_ann_and_get_head(&mut hp_head);
+            unsafe { (*ann_ptr).old_head_node = old_head_ptr };
+            if self
+                .head
+                .compare_exchange(
+                    old_head_ptr,
+                    tagged_ann_ptr,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                break;
             }
-            unsafe {
-                (*ann_ptr).old_head_node = head_node_ptr;
-                (*ann_ptr).old_head_count = head_count;
-                original_head_ptr = head_node_ptr;
-            }
-
-            match self.head.compare_exchange(
-                head_node_ptr,
-                tagged_ann_ptr,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    /* ... */
-                    hp_head.reset_protection();
-                    break;
-                }
-                Err(_) => { /* ... */ }
-            }
-            hp_head.reset_protection();
         }
 
-        self.execute_ann(ann_ptr); // Использует глоб. домен
-
-        // retire_ann на глоб. домене
+        hp_head.reset_protection();
+        self.execute_ann(ann_ptr);
         unsafe {
-            domain.retire_ann(ann_ptr);
-        } //
-
-        original_head_ptr
+            Domain::global().retire_ann(ann_ptr);
+        }
     }
 
     fn execute_ann(&self, ann_ptr: *mut Ann<T>) {
         let ann = unsafe { &*ann_ptr };
         let mut hp_tail = HazardPointer::new();
+        let mut ann_old_tail: *mut Node<T> = std::ptr::null_mut();
 
-        // --- Шаг 1: Связать элементы батча ---
-        // ... (логика цикла, загрузки tail, CAS next) ...
         loop {
-            let recorded_old_tail = ann.old_tail_node.load_ptr();
-            if !recorded_old_tail.is_null() {
+            let tail = unsafe { self.tail.as_std().load(Ordering::Acquire) };
+            let old_tail = ann.old_tail_node.safe_load(&mut hp_tail);
+            if old_tail.is_some() {
+                ann_old_tail = old_tail.unwrap() as *const _ as *mut _;
+                if tag_ann(ann_ptr) != self.head.load(Ordering::Acquire) {
+                    return;
+                }
                 break;
             }
-            let tail_node_opt = unsafe { self.tail.load(&mut hp_tail) };
-            if tail_node_opt.is_none() {
-                hp_tail.reset_protection();
+            let tail_node = unsafe { hp_tail.try_protect(tail, self.tail.as_std()) };
+            if tail_node.is_err() || tail_node.unwrap().is_none() {
+                if tag_ann(ann_ptr) != self.head.load(Ordering::Acquire) {
+                    return;
+                }
                 continue;
             }
-            let tail_node = tail_node_opt.unwrap();
-            let tail_node_ptr = tail_node as *const _ as *mut _;
-            let tail_count = tail_node.count.load(Ordering::Acquire);
-            let std_next_atomic_ptr = unsafe { tail_node.next.as_std() };
-            match std_next_atomic_ptr.compare_exchange(
-                ptr::null_mut(),
-                ann.batch_req.first_enq,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    /* ... */
-                    let _ = ann
-                        .old_tail_node
-                        .compare_exchange_ptr(ptr::null_mut(), tail_node_ptr);
-                    ann.old_tail_count.compare_exchange(
-                        0,
-                        tail_count,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
-                    break;
-                }
-                Err(actual_next_ptr) => {
-                    if actual_next_ptr == ann.batch_req.first_enq {
-                        /* ... */
-                        let _ = ann
-                            .old_tail_node
-                            .compare_exchange_ptr(ptr::null_mut(), tail_node_ptr);
-                        ann.old_tail_count.compare_exchange(
-                            0,
-                            tail_count,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        );
-                        break;
-                    } else {
-                        /* ... */
-                        if !actual_next_ptr.is_null() {
-                            let _ = unsafe {
-                                self.tail
-                                    .compare_exchange_ptr(tail_node_ptr, actual_next_ptr)
-                            };
-                        }
-                    }
-                }
+            let tail_node = tail_node.unwrap().unwrap();
+            unsafe {
+                let _ = tail_node
+                    .next
+                    .compare_exchange_ptr(null_mut(), ann.batch_req.first_enq);
+            }
+            if tail_node.next.load_ptr() == ann.batch_req.first_enq {
+                ann_old_tail = tail_node as *const _ as *mut _;
+                unsafe { ann.old_tail_node.store_ptr(tail_node as *const _ as *mut _) };
+                break;
+            } else {
+                let _ = unsafe {
+                    self.tail
+                        .compare_exchange_ptr(ann_old_tail, tail_node.next.load_ptr())
+                };
             }
             hp_tail.reset_protection();
         }
-        hp_tail.reset_protection();
-
-        // --- Шаг 2: Обновить SQTail ---
-        // ... (логика установки счетчика и CAS tail) ...
-        let old_tail_node_ptr = ann.old_tail_node.load_ptr();
-        let old_tail_count = ann.old_tail_count.load(Ordering::Acquire);
-        let new_tail_node_ptr = ann.batch_req.last_enq;
-        let num_enqs = ann.batch_req.enqs_num;
-        let new_tail_count = old_tail_count + num_enqs;
-        unsafe {
-            (*new_tail_node_ptr)
-                .count
-                .store(new_tail_count, Ordering::Release);
-        }
         let _ = unsafe {
             self.tail
-                .compare_exchange_ptr(old_tail_node_ptr, new_tail_node_ptr)
+                .compare_exchange_ptr(ann_old_tail, ann.batch_req.last_enq)
         };
+        hp_tail.reset_protection();
 
-        // --- Шаг 3: Обновить Head ---
-        // ... (логика CAS head) ...
         let target_head_node_ptr = ann.old_head_node;
-        let current_head_raw = self.head.load(Ordering::Acquire);
         let _ = self.head.compare_exchange(
-            current_head_raw,
+            tag_ann(ann_ptr),
             target_head_node_ptr,
             Ordering::Release,
-            Ordering::Acquire,
+            Ordering::Relaxed,
         );
     }
 
-    // --- Публичный интерфейс (без явного Domain) ---
-
-    /// Одиночная операция Enqueue.
-    pub fn enqueue(&self, item: T) {
-        // Убрали domain
-        self.enqueue_to_shared(item);
-    }
-
-    /// Одиночная операция Dequeue.
-    pub fn dequeue(&self) -> Option<T> {
-        // Убрали domain
-        self.dequeue_from_shared()
-    }
-
-    /// Пакетная вставка из итератора.
     pub fn enqueue_batch<I>(&self, items: I)
-    // Убрали domain
     where
         I: IntoIterator<Item = T>,
     {
-        // ... (логика создания локального списка узлов без изменений) ...
-        let mut enqs_head: *mut Node<T> = ptr::null_mut();
-        let mut enqs_tail: *mut Node<T> = ptr::null_mut();
-        let mut enqs_num = 0;
-        let mut local_nodes: Vec<Box<Node<T>>> = Vec::new();
-        for item in items {
-            let new_node_box = Box::new(Node {
-                item: Some(item),
-                next: AtomicPtr::from(ptr::null_mut::<Node<T>>()),
-                count: AtomicUsize::new(0),
-            });
-            local_nodes.push(new_node_box);
-            let new_node_ptr = &**local_nodes.last().unwrap() as *const _ as *mut _;
-            if enqs_head.is_null() {
-                enqs_head = new_node_ptr;
-                enqs_tail = new_node_ptr;
-            } else {
+        let mut items_iter = items.into_iter();
+        let enqs_head: *mut Node<T>;
+        let mut enqs_tail: *mut Node<T>;
+
+        if let Some(first_item) = items_iter.next() {
+            let first_node = Box::new(Node::new(first_item)).into_raw();
+            enqs_head = first_node;
+            enqs_tail = first_node;
+
+            for item in items_iter {
+                let new_node = Box::into_raw(Box::new(Node::new(item)));
                 unsafe {
-                    let tail_node_ref = &mut *enqs_tail;
-                    tail_node_ref
-                        .next
-                        .as_std()
-                        .store(new_node_ptr, Ordering::Relaxed);
+                    (*enqs_tail).next.store_ptr(new_node);
                 }
-                enqs_tail = new_node_ptr;
+                enqs_tail = new_node;
             }
-            enqs_num += 1;
-        }
-        if enqs_num == 0 {
+        } else {
             return;
         }
 
         let batch_req = InternalBatchRequest {
-            /* ... */ first_enq: enqs_head,
+            first_enq: enqs_head,
             last_enq: enqs_tail,
-            enqs_num,
         };
-        // execute_enqs_batch использует глоб. домен
-        let _ = self.execute_enqs_batch(batch_req); //
+        self.execute_enqs_batch(batch_req);
+    }
+}
 
-        // "Забываем" Box'ы
-        for node_box in local_nodes {
-            Box::into_raw(node_box);
+impl<T> Drop for BQueue<T>
+where
+    T: Send + Sync,
+{
+    fn drop(&mut self) {
+        while self.dequeue().is_some() {}
+        let pointer = self.tail.load_ptr();
+        if !pointer.is_null() {
+            unsafe { Domain::global().retire_node(pointer) };
         }
     }
+}
 
-    /// Пакетное извлечение до `max_count` элементов.
-    pub fn dequeue_batch(&self, max_count: usize) -> Vec<Option<T>> {
-        // Убрали domain
-        if max_count == 0 {
-            return Vec::new();
+pub struct DeqBatchIterator<T> {
+    num_deqs_remaining: usize,
+    last_deq_item: Option<T>,
+    current: *mut Node<T>,
+}
+
+impl<'a, T> DeqBatchIterator<T>
+where
+    T: Send + Sync,
+{
+    fn new(num_deqs_remaining: usize, last_deq_item: Option<T>, current: *mut Node<T>) -> Self {
+        Self {
+            num_deqs_remaining: num_deqs_remaining,
+            last_deq_item: last_deq_item,
+            current: current,
         }
-        let domain = Domain::global(); // Получаем глобальный домен
+    }
+}
 
-        // execute_deqs_batch использует глоб. домен
-        let (original_head_ptr, success_count) = self.execute_deqs_batch(max_count); //
+impl<'a, T> Iterator for DeqBatchIterator<T>
+where
+    T: Send + Sync,
+{
+    type Item = T;
 
-        if success_count == 0 {
-            /* ... */
-            return core::iter::repeat(None).take(max_count).collect();
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.num_deqs_remaining == 0 {
+            return None;
         }
-
-        // Локальное сопоставление результатов и удаление узлов
-        let mut results = Vec::with_capacity(max_count);
-        let mut hp_traverse = HazardPointer::new(); // Использует глоб. домен
-
-        let mut current_node_ptr = original_head_ptr;
-        for i in 0..max_count {
-            if i < success_count {
-                let maybe_protected_node = unsafe { hp_traverse.protect_raw(current_node_ptr) }; // Использует глоб. домен
-                                                                                                 // ... (логика извлечения item и retire_node) ...
-                if maybe_protected_node.is_none() {
-                    /* ... */
-                    results.push(None);
-                    current_node_ptr = ptr::null_mut();
-                    continue;
-                }
-                let protected_node_ptr = maybe_protected_node.unwrap().as_ptr();
-                let protected_node_ref = unsafe { &*protected_node_ptr };
-                let next_node_ptr = protected_node_ref.next.load_ptr();
-                let item = if !next_node_ptr.is_null() {
-                    unsafe { (*next_node_ptr).item.take() }
-                } else {
-                    None
-                };
-                results.push(item);
-                // retire_node на глоб. домене
-                unsafe {
-                    domain.retire_node(current_node_ptr);
-                } //
-                current_node_ptr = next_node_ptr;
-            } else {
-                results.push(None); //
-            }
+        if self.num_deqs_remaining == 1 {
+            self.num_deqs_remaining -= 1;
+            return self.last_deq_item.take();
         }
-        hp_traverse.reset_protection();
-        // ... (дополнение results до max_count) ...
-        while results.len() < max_count {
-            results.push(None);
-        }
+        let to_retire = self.current;
+        self.current = unsafe { (*self.current).next.load_ptr() };
+        unsafe { Domain::global().retire_node(to_retire) };
+        self.num_deqs_remaining -= 1;
+        return unsafe {
+            Some(std::ptr::read(
+                (*self.current).item.assume_init_ref() as *const _
+            ))
+        };
+    }
+}
 
-        results
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_enqueue_dequeue_single() {
+        let q = BQueue::new();
+        assert_eq!(q.dequeue(), None);
+        q.enqueue(42);
+        assert_eq!(q.dequeue(), Some(42));
+        assert_eq!(q.dequeue(), None);
+    }
+    #[test]
+    fn test_batch_deq_zero() {
+        let q = BQueue::new();
+        for i in 0..5 {
+            q.enqueue(i);
+        }
+        let mut it = q.execute_deqs_batch(0);
+        assert_eq!(it.next(), None);
+    }
+    #[test]
+    fn test_batch_deq_exact() {
+        let q = BQueue::new();
+        for i in 0..3 {
+            q.enqueue(i);
+        }
+        let it = q.execute_deqs_batch(3);
+        assert_eq!(it.collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+    #[test]
+    fn test_batch_deq_more() {
+        let q = BQueue::new();
+        for i in 0..2 {
+            q.enqueue(i);
+        }
+        let it = q.execute_deqs_batch(5);
+        assert_eq!(it.collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_multiple_enqueue_dequeue() {
+        let q = BQueue::new();
+        for i in 0..5 {
+            q.enqueue(i);
+        }
+        for i in 0..5 {
+            assert_eq!(q.dequeue(), Some(i));
+        }
+        assert_eq!(q.dequeue(), None);
+    }
+
+    #[test]
+    fn test_enqueue_batch_empty() {
+        let q: BQueue<i32> = BQueue::new();
+        q.enqueue_batch(Vec::<i32>::new());
+        assert_eq!(q.dequeue(), None);
+    }
+
+    #[test]
+    fn test_enqueue_batch_and_single_dequeue() {
+        let q = BQueue::new();
+        q.enqueue_batch(vec![10, 20, 30]);
+        assert_eq!(q.dequeue(), Some(10));
+        assert_eq!(q.dequeue(), Some(20));
+        assert_eq!(q.dequeue(), Some(30));
+        assert_eq!(q.dequeue(), None);
+    }
+
+    #[test]
+    fn test_execute_deqs_batch_partial() {
+        let q = BQueue::new();
+        for i in 0..5 {
+            q.enqueue(i);
+        }
+        let it = q.execute_deqs_batch(3);
+        assert_eq!(it.collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(q.dequeue(), Some(3));
+        assert_eq!(q.dequeue(), Some(4));
+        assert_eq!(q.dequeue(), None);
+    }
+
+    #[test]
+    fn test_interleave_batch_and_single() {
+        let q = BQueue::new();
+        q.enqueue(100);
+        q.enqueue_batch(vec![200, 300]);
+        assert_eq!(q.dequeue(), Some(100));
+        let it = q.execute_deqs_batch(2);
+        assert_eq!(it.collect::<Vec<_>>(), vec![200, 300]);
+        assert_eq!(q.dequeue(), None);
+    }
+
+    #[test]
+    fn test_drop_does_not_crash() {
+        let q = BQueue::new();
+        for i in 0..10 {
+            q.enqueue(i);
+        }
+        drop(q);
     }
 }
