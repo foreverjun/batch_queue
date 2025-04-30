@@ -414,7 +414,7 @@ pub struct DeqBatchIterator<T> {
     current: *mut Node<T>,
 }
 
-impl<'a, T> DeqBatchIterator<T>
+impl<T> DeqBatchIterator<T>
 where
     T: Send + Sync,
 {
@@ -427,7 +427,7 @@ where
     }
 }
 
-impl<'a, T> Iterator for DeqBatchIterator<T>
+impl<T> Iterator for DeqBatchIterator<T>
 where
     T: Send + Sync,
 {
@@ -450,6 +450,15 @@ where
                 (*self.current).item.assume_init_ref() as *const _
             ))
         };
+    }
+}
+
+impl<T> ExactSizeIterator for DeqBatchIterator<T>
+where
+    T: Send + Sync,
+{
+    fn len(&self) -> usize {
+        self.num_deqs_remaining
     }
 }
 
