@@ -213,7 +213,7 @@ where
         }
     }
 
-    pub fn execute_deqs_batch(&self, num_deqs_requested: usize) -> DeqBatchIterator<T> {
+    pub fn deq_batch(&self, num_deqs_requested: usize) -> DeqBatchIterator<T> {
         let mut hp_head = HazardPointer::new();
         let mut hp1 = HazardPointer::new();
         let mut hp2 = HazardPointer::new();
@@ -470,7 +470,7 @@ mod tests {
         for i in 0..5 {
             q.enqueue(i);
         }
-        let mut it = q.execute_deqs_batch(0);
+        let mut it = q.deq_batch(0);
         assert_eq!(it.next(), None);
     }
     #[test]
@@ -479,7 +479,7 @@ mod tests {
         for i in 0..3 {
             q.enqueue(i);
         }
-        let it = q.execute_deqs_batch(3);
+        let it = q.deq_batch(3);
         assert_eq!(it.collect::<Vec<_>>(), vec![0, 1, 2]);
     }
     #[test]
@@ -488,7 +488,7 @@ mod tests {
         for i in 0..2 {
             q.enqueue(i);
         }
-        let it = q.execute_deqs_batch(5);
+        let it = q.deq_batch(5);
         assert_eq!(it.collect::<Vec<_>>(), vec![0, 1]);
     }
 
@@ -527,7 +527,7 @@ mod tests {
         for i in 0..5 {
             q.enqueue(i);
         }
-        let it = q.execute_deqs_batch(3);
+        let it = q.deq_batch(3);
         assert_eq!(it.collect::<Vec<_>>(), vec![0, 1, 2]);
         assert_eq!(q.dequeue(), Some(3));
         assert_eq!(q.dequeue(), Some(4));
@@ -540,7 +540,7 @@ mod tests {
         q.enqueue(100);
         q.enqueue_batch(vec![200, 300]);
         assert_eq!(q.dequeue(), Some(100));
-        let it = q.execute_deqs_batch(2);
+        let it = q.deq_batch(2);
         assert_eq!(it.collect::<Vec<_>>(), vec![200, 300]);
         assert_eq!(q.dequeue(), None);
     }
